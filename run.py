@@ -12,6 +12,12 @@ import subprocess
 from bids.layout import BIDSLayout
 from functools import partial
 from collections import OrderedDict
+import re
+from itertools import groupby
+from tedana.workflows import t2smap_workflow, tedana_workflow
+
+grayordinatesres = "2" # This is currently the only option for which the is an atlas
+lowresmesh = 32
 
 def run(command, env={}, cwd=None):
     merged_env = os.environ
@@ -28,9 +34,6 @@ def run(command, env={}, cwd=None):
             break
     if process.returncode != 0:
         raise Exception("Non zero return code: %d"%process.returncode)
-
-grayordinatesres = "2" # This is currently the only option for which the is an atlas
-lowresmesh = 32
 
 def run_pre_freesurfer(**args):
     args.update(os.environ)
@@ -112,8 +115,93 @@ def run_post_freesurfer(**args):
     cmd = cmd.format(**args)
     run(cmd, cwd=args["path"], env={"OMP_NUM_THREADS": str(args["n_cpus"])})
 
+def run_onestep_resampling(**args):
+    args.update(os.environ)
+    fmrifolder = '{path}/{subject}/{fmriname}'.format(**args)
+    atlasspacefolder = '{path}/{subject}/MNINonLinear'.format(**args)
+    t1wfolder = '{path}/{subject}/T1w'.format(**args)
+    fmriscout = fmritcs.replace("_bold", "_sbref")
+    args.update(dict(fmrifolder=fmrifolder,
+                    atlasspacefolder=atlasspacefolder,
+                    t1wfolder=t1wfolder,
+                    fmriscout=fmriscout))
+
+    cmd = '{HCPPIPEDIR}/fMRIVolume/scripts/OneStepResampling.sh ' + \
+        '--workingdir="{fmrifolder}/OneStepResampling" ' + \
+        '--infmri="{fmritcs}" ' + \
+        '--t1="{atlasspacefolder}/T1w_restore" ' + \
+        '--fmriresout="{fmrires:s}" ' + \
+        '--fmrifolder="{fmrifolder}" ' + \
+        '--fmri2structin="{t1wfolder}/xfms/{fmriname}2str" ' + \
+        '--struct2std="{atlasspacefolder}/xfms/acpc_dc2standard" ' + \
+        '--owarp="{atlasspacefolder}/xfms/{fmriname}2standard" ' + \
+        '--oiwarp="{atlasspacefolder}/xfms/standard2{fmriname}" ' + \
+        '--motionmatdir="{fmrifolder}/MotionMatrices" ' + \
+        '--motionmatprefix="MAT_" ' + \
+        '--ofmri="{fmrifolder}/{fmriname}_echo-{echonum}_nonlin" ' + \
+        '--freesurferbrainmask="{atlasspacefolder}/brainmask_fs" ' + \
+        '--biasfield="{atlasspacefolder}/BiasField" ' + \
+        '--gdfield="{fmrifolder}/{fmriname}_gdc_warp" ' + \
+        '--scoutin="{fmriscout}" ' + \
+        '--scoutgdcin="{fmrifolder}/Scout_gdc" ' + \
+        '--oscout="{fmrifolder}/{fmriname}_echo-{echonum}_SBRef_nonlin" ' + \
+        '--ojacobian="{fmrifolder}/Jacobian_MNI.{fmrires:s}" '
+    cmd = cmd.format(**args)
+    run(cmd, cwd=args["path"], env={"OMP_NUM_THREADS": str(args["n_cpus"])})
+
+def run_tedana(**args):
+    fmrifolder = '{path}/{subject}/{fmriname}'.format(**args)
+    os.chdir(fmrifolder)
+
+    data = ['%s/%s_echo-%d_nonlin.nii.gz' % (fmrifolder, args['fmriname'], echo_idx + 1) for echo_idx, _ in enumerate(args['echotimes'])]
+    mask = '{fmrifolder}/brainmask.fs.{fmrires:s}'.format(**args)
+
+    if args['multiechoout'] == 't2smap':
+        t2smap_workflow(data, args['echotimes'], mask,
+                                              label='ted')
+        return os.path.join(fmrifolder, 'TED.ted', 'ts_OC.nii')
+
+    elif args['multiechoout'] == 'meica':
+        tedana_workflow(data, args['echotimes'], mask,
+                                              verbose=True, png=True,
+                                              out_dir='TED.ted')
+        return os.path.join(fmrifolder, 'TED.ted', 'dn_ts_OC.nii')
+
+def run_intensity_normalization(**args):
+    args.update(os.environ)
+    args['fmrifolder'] = '{path}/{subject}/{fmriname}'.format(**args)
+    args['atlasspacefolder'] = '{path}/{subject}/MNINonLinear'.format(**args)
+
+    cmd = '{HCPPIPEDIR}/IntensityNormalization.sh ' + \
+       '--infmri="{infmri}" ' + \
+       '--biasfield="{atlasspacefolder}/Results/{fmriname}/{fmriname}_sebased_bias.nii.gz" ' + \
+       '--jacobian="{fmrifolder}/Jacobian_MNI.{fmrires:s}" ' + \
+       '--brainmask="{fmrifolder}/brainmask.fs.{fmrires:s}" '+ \
+       '--ofmri="{fmrifolder}/{fmriname}_nonlin_norm" ' + \
+       '--inscout="{fmrifolder}/{fmriname}_SBRef_nonlin" ' + \
+       '--oscout="{fmrifolder}/{fmriname}_SBRef_nonlin_norm" '+ \
+       '--usejacobian=true'
+    cmd = cmd.format(**args)
+    run(cmd, cwd=args["path"], env={"OMP_NUM_THREADS": str(args["n_cpus"])})
+
+def copy_fmrivolume_results(**args):
+    fmrifolder = '{path}/{subject}/{fmriname}'.format(**args)
+    resultsfolder = '{path}/{subject}/MNINonLinear/Results/{fmriname}'.format(**args)
+
+    shutil.copyfile('{fmrifolder}/{fmriname}_nonlin_norm.nii.gz'.format(fmrifolder, resultsfolder),
+                    '{resultsfolder}/{fmriname}.nii.gz'.format(fmrifolder, resultsfolder))
+    shutil.copyfile('{fmrifolder}/{fmriname}_SBRef_nonlin_norm.nii.gz'.format(fmrifolder, resultsfolder),
+                    '{resultsfolder}/{fmriname}_SBRef.nii.gz'.format(fmrifolder, resultsfolder))
+    # TODO: replace ${ResultsFolder}/${NameOffMRI}_dropouts.nii.gz with tedna output?
+
 def run_generic_fMRI_volume_processsing(**args):
     args.update(os.environ)
+
+    # check for multi-echo data
+    allechoes = args['allechoes']
+    if isinstance(allechoes, list):
+        args['fmritcs'] = allechoes[0]
+
     cmd = '{HCPPIPEDIR}/fMRIVolume/GenericfMRIVolumeProcessingPipeline.sh ' + \
       '--path={path} ' + \
       '--subject={subject} ' + \
@@ -138,6 +226,27 @@ def run_generic_fMRI_volume_processsing(**args):
     cmd = cmd.format(**args)
     run(cmd, cwd=args["path"], env={"OMP_NUM_THREADS": str(args["n_cpus"])})
 
+    if isinstance(allechoes, list):
+        # For multi-echo data, the full fMRIVolume Pipeline is run on the first
+        # echo to obtain movement and warp parameters.
+        # OneStepResampling is run on the subsequent echoes using the transforms
+        # from the first echo
+        # Then combine the echoes and run IntensityNormalization on the combined
+        # data. This allows the HCP Pipelines to be used without modifications
+        # at the cost of redundant processing and file management
+
+        # Apply OneStepResampling to later echoes
+        for echo_idx, echo in enumerate(allechoes):
+            args['fmritcs'] = echo
+            args['echonum'] = str(echo_idx + 1)
+            run_onestep_resampling(**args)
+
+        # run tedana
+        args['infmri'] = run_tedana(**args)
+        # IntensityNormalization
+        run_intensity_normalization(**args)
+        copy_fmrivolume_results(**args)
+
 def run_generic_fMRI_surface_processsing(**args):
     args.update(os.environ)
     cmd = '{HCPPIPEDIR}/fMRISurface/GenericfMRISurfaceProcessingPipeline.sh ' + \
@@ -152,7 +261,7 @@ def run_generic_fMRI_surface_processsing(**args):
     cmd = cmd.format(**args)
     run(cmd, cwd=args["path"], env={"OMP_NUM_THREADS": str(args["n_cpus"])})
 
-def run_diffusion_processsing(**args):
+def run_diffusion_processing(**args):
     args.update(os.environ)
     cmd = '{HCPPIPEDIR}/DiffusionPreprocessing/DiffPreprocPipeline.sh ' + \
       '--posData="{posData}" ' +\
@@ -166,6 +275,10 @@ def run_diffusion_processsing(**args):
     cmd = cmd.format(**args)
     run(cmd, cwd=args["path"], env={"OMP_NUM_THREADS": str(args["n_cpus"])})
 
+# from fmriprep
+def _run_num(x):
+    return re.search("run-\\d*", x).group(0)
+     
 __version__ = open('/version').read()
 
 parser = argparse.ArgumentParser(description='HCP Pipelines BIDS App (T1w, T2w, fMRI)')
@@ -198,12 +311,18 @@ parser.add_argument('--coreg', help='Coregistration method to use',
                     choices=['MSMSulc', 'FS'], default='MSMSulc')
 parser.add_argument('--gdcoeffs', help='Gradients coefficients file',
                     default="NONE")
+parser.add_argument('--anat_unwarpdir', help='Unwarp direction for 3D volumes',
+                    choices=['x', 'y', 'z', '-x', '-y', '-z'], default="NONE")
+parser.add_argument('--multiecho', help='How to handle multi-echo data at the fMRIVolume stage.'
+                    'each: process each echo as a separate run'
+                    't2smap: output an optimally combined dataset'
+                    'meica: output a ME-ICA denoised dataset',
+                    choices=['each', 't2smap', 'meica'], default='meica')
 parser.add_argument('--license_key', help='FreeSurfer license key - letters and numbers after "*" in the email you received after registration. To register (for free) visit https://surfer.nmr.mgh.harvard.edu/registration.html',
                     required=True)
 parser.add_argument('-v', '--version', action='version',
                     version='HCP Pipelines BIDS App version {}'.format(__version__))
-parser.add_argument('--anat_unwarpdir', help='Unwarp direction for 3D volumes',
-                    choices=['x', 'y', 'z', '-x', '-y', '-z'], default="NONE")
+
 
 args = parser.parse_args()
 
@@ -349,8 +468,24 @@ if args.analysis_level == "participant":
 
         bolds = [f.path for f in layout.get(subject=subject_label,
                                                 suffix='bold',
+                                                datatype='func',
                                                 extensions=["nii.gz", "nii"])]
+        
+        # get multiple echoes as a list. Code from fmriprep
+        if (args.multiecho != 'each') and (bolds is not []):
+            try:
+                bolds = [list(bolds) for _, bold in groupby(bolds, key=_run_num)]
+                bolds = list(map(lambda x: x[0] if len(x) == 1 else x, bolds))
+            except AttributeError:
+                pass
+
         for fmritcs in bolds:
+            allechoes = fmritcs
+            echotimes = None
+            if isinstance(allechoes, list):
+                echotimes = [layout.get_metadata(e)['EchoTime'] for e in fmritcs]
+                fmritcs = fmritcs[0] # use the first echo for the main processing
+            
             fmriname = "_".join(fmritcs.split("sub-")[-1].split("_")[1:]).split(".")[0]
             assert fmriname
 
@@ -383,8 +518,6 @@ if args.analysis_level == "participant":
                 dcmethod = "NONE"
                 biascorrection = "NONE"
 
-            zooms = nibabel.load(fmritcs).get_header().get_zooms()
-            fmrires = float(min(zooms[:3]))
             fmrires = "2" # https://github.com/Washington-University/Pipelines/blob/637b35f73697b77dcb1d529902fc55f431f03af7/fMRISurface/scripts/SubcorticalProcessing.sh#L43
             # While running '/usr/bin/wb_command -cifti-create-dense-timeseries /scratch/users/chrisgor/hcp_output2/sub-100307/MNINonLinear/Results/EMOTION/EMOTION_temp_subject.dtseries.nii -volume /scratch/users/chrisgor/hcp_output2/sub-100307/MNINonLinear/Results/EMOTION/EMOTION.nii.gz /scratch/users/chrisgor/hcp_output2/sub-100307/MNINonLinear/ROIs/ROIs.2.nii.gz':
             # ERROR: label volume has a different volume space than data volume
@@ -394,7 +527,7 @@ if args.analysis_level == "participant":
                                                       path=args.output_dir,
                                                       subject="sub-%s"%subject_label,
                                                       fmriname=fmriname,
-                                                      fmritcs=fmritcs,
+                                                      fmritcs=allechoes,
                                                       fmriscout=fmriscout,
                                                       SEPhaseNeg=SEPhaseNeg,
                                                       SEPhasePos=SEPhasePos,
@@ -404,7 +537,9 @@ if args.analysis_level == "participant":
                                                       dcmethod=dcmethod,
                                                       biascorrection=biascorrection,
                                                       n_cpus=args.n_cpus,
-                                                      gdcoeffs=args.gdcoeffs)),
+                                                      gdcoeffs=args.gdcoeffs,
+                                                      echotimes=echotimes,
+                                                      multiechoout=args.multiecho)),
                                 ("fMRISurface", partial(run_generic_fMRI_surface_processsing,
                                                        path=args.output_dir,
                                                        subject="sub-%s"%subject_label,

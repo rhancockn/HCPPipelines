@@ -161,6 +161,9 @@ RUN wget -q https://github.com/Washington-University/gradunwarp/archive/v1.1.0.z
 
 RUN wget -q https://raw.githubusercontent.com/Washington-University/HCPpipelines/dc7aae3a7a1cae920b390500d85536681b14108c/global/scripts/TopupPreprocessingAll.sh -O /opt/HCP-Pipelines/global/scripts/TopupPreprocessingAll.sh
 
+# Install tedana
+RUN pip install tedana
+
 # Install MCR 2016b
 ENV MATLABCMD="/opt/matlabmcr-2016b/v91/toolbox/matlab" \
     MATLAB_COMPILER_RUNTIME="/opt/matlabmcr-2016b/v91" \
