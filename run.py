@@ -14,7 +14,6 @@ from functools import partial
 from collections import OrderedDict
 import re
 from itertools import groupby
-from tedana.workflows import t2smap_workflow, tedana_workflow
 
 grayordinatesres = "2" # This is currently the only option for which the is an atlas
 lowresmesh = 32
@@ -120,7 +119,7 @@ def run_onestep_resampling(**args):
     fmrifolder = '{path}/{subject}/{fmriname}'.format(**args)
     atlasspacefolder = '{path}/{subject}/MNINonLinear'.format(**args)
     t1wfolder = '{path}/{subject}/T1w'.format(**args)
-    fmriscout = fmritcs.replace("_bold", "_sbref")
+    fmriscout = args['fmritcs'].replace("_bold", "_sbref")
     args.update(dict(fmrifolder=fmrifolder,
                     atlasspacefolder=atlasspacefolder,
                     t1wfolder=t1wfolder,
@@ -150,33 +149,50 @@ def run_onestep_resampling(**args):
     run(cmd, cwd=args["path"], env={"OMP_NUM_THREADS": str(args["n_cpus"])})
 
 def run_tedana(**args):
-    fmrifolder = '{path}/{subject}/{fmriname}'.format(**args)
-    os.chdir(fmrifolder)
-
-    data = ['%s/%s_echo-%d_nonlin.nii.gz' % (fmrifolder, args['fmriname'], echo_idx + 1) for echo_idx, _ in enumerate(args['echotimes'])]
-    mask = '{fmrifolder}/brainmask.fs.{fmrires:s}'.format(**args)
+    # TODO: Take -min and copy TED.ted/adaptive_mask.nii to brainmask_fs
+    args.update(os.environ)
+    args['fmrifolder'] = '{path}/{subject}/{fmriname}'.format(**args)
+    data = ['%s/%s_echo-%d_nonlin.nii.gz' % (args['fmrifolder'], args['fmriname'], echo_idx + 1) for echo_idx, _ in enumerate(args['echotimes'])]
+    data[0] = re.sub(r'_echo-\d+', '', data[0])
+    data = ' '.join(data)
+    tes = ' '.join([str(te*1000.0) for te in args['echotimes']])
+    mask = '{fmrifolder}/brainmask_fs.{fmrires:s}.nii.gz'.format(**args)
+    cmd = '/tedana_wrapper.sh '
 
     if args['multiechoout'] == 't2smap':
-        t2smap_workflow(data, args['echotimes'], mask,
-                                              label='ted')
-        return os.path.join(fmrifolder, 'TED.ted', 'ts_OC.nii')
+        cmd = cmd + \
+            't2smap -d {data} ' + \
+            '-e {tes} ' + \
+            '--label ted '
+
+        cmd = cmd.format(data=data, tes=tes, mask=mask)
+        run(cmd, cwd=fmrifolder, env={"OMP_NUM_THREADS": str(args["n_cpus"])})
+
+        return os.path.join(args['fmrifolder'], 'TED.' + args['fmriname'], 'ts_OC.nii')
 
     elif args['multiechoout'] == 'meica':
-        tedana_workflow(data, args['echotimes'], mask,
-                                              verbose=True, png=True,
-                                              out_dir='TED.ted')
-        return os.path.join(fmrifolder, 'TED.ted', 'dn_ts_OC.nii')
+        cmd = cmd + \
+            'tedana -d {data} ' + \
+            '-e {tes} ' + \
+            '--out-dir TED.ted ' + \
+            '--png '
+
+        cmd = cmd.format(data=data, tes=tes, mask=mask)
+        run(cmd, cwd=args['fmrifolder'], env={"OMP_NUM_THREADS": str(args["n_cpus"])})
+        return os.path.join(args['fmrifolder'], 'TED.ted', 'dn_ts_OC.nii')
+    else:
+        raise ValueError('Unsupported multi-echo combination')
 
 def run_intensity_normalization(**args):
     args.update(os.environ)
     args['fmrifolder'] = '{path}/{subject}/{fmriname}'.format(**args)
     args['atlasspacefolder'] = '{path}/{subject}/MNINonLinear'.format(**args)
 
-    cmd = '{HCPPIPEDIR}/IntensityNormalization.sh ' + \
+    cmd = '{HCPPIPEDIR}/fMRIVolume/scripts/IntensityNormalization.sh ' + \
        '--infmri="{infmri}" ' + \
        '--biasfield="{atlasspacefolder}/Results/{fmriname}/{fmriname}_sebased_bias.nii.gz" ' + \
        '--jacobian="{fmrifolder}/Jacobian_MNI.{fmrires:s}" ' + \
-       '--brainmask="{fmrifolder}/brainmask.fs.{fmrires:s}" '+ \
+       '--brainmask="{fmrifolder}/brainmask_fs.{fmrires:s}" '+ \
        '--ofmri="{fmrifolder}/{fmriname}_nonlin_norm" ' + \
        '--inscout="{fmrifolder}/{fmriname}_SBRef_nonlin" ' + \
        '--oscout="{fmrifolder}/{fmriname}_SBRef_nonlin_norm" '+ \
@@ -185,22 +201,27 @@ def run_intensity_normalization(**args):
     run(cmd, cwd=args["path"], env={"OMP_NUM_THREADS": str(args["n_cpus"])})
 
 def copy_fmrivolume_results(**args):
-    fmrifolder = '{path}/{subject}/{fmriname}'.format(**args)
-    resultsfolder = '{path}/{subject}/MNINonLinear/Results/{fmriname}'.format(**args)
-
-    shutil.copyfile('{fmrifolder}/{fmriname}_nonlin_norm.nii.gz'.format(fmrifolder, resultsfolder),
-                    '{resultsfolder}/{fmriname}.nii.gz'.format(fmrifolder, resultsfolder))
-    shutil.copyfile('{fmrifolder}/{fmriname}_SBRef_nonlin_norm.nii.gz'.format(fmrifolder, resultsfolder),
-                    '{resultsfolder}/{fmriname}_SBRef.nii.gz'.format(fmrifolder, resultsfolder))
+    names = dict(fmrifolder = '{path}/{subject}/{fmriname}'.format(**args),
+                resultsfolder='{path}/{subject}/MNINonLinear/Results/{fmriname}'.format(**args),
+                fmriname = args['fmriname'])
+    
+    shutil.copyfile('{fmrifolder}/{fmriname}_nonlin_norm.nii.gz'.format(**names),
+                    '{resultsfolder}/{fmriname}.nii.gz'.format(**names))
+    shutil.copyfile('{fmrifolder}/{fmriname}_SBRef_nonlin_norm.nii.gz'.format(**names),
+                    '{resultsfolder}/{fmriname}_SBRef.nii.gz'.format(**names))
     # TODO: replace ${ResultsFolder}/${NameOffMRI}_dropouts.nii.gz with tedna output?
 
 def run_generic_fMRI_volume_processsing(**args):
     args.update(os.environ)
 
     # check for multi-echo data
-    allechoes = args['allechoes']
+    allechoes = args['fmritcs']
     if isinstance(allechoes, list):
-        args['fmritcs'] = allechoes[0]
+        args['fmritcs'] = allechoes.pop(0)
+        args['fmriname'] = re.sub(r'_echo-\d+', '', args['fmritcs'])
+        args['fmriname'] = os.path.basename(args['fmriname'])
+        args['fmriname'] = re.sub(r'.nii.*', '', args['fmriname'])
+        args['fmriname'] = re.sub(r'sub-\w+_', '', args['fmriname'])
 
     cmd = '{HCPPIPEDIR}/fMRIVolume/GenericfMRIVolumeProcessingPipeline.sh ' + \
       '--path={path} ' + \
@@ -224,6 +245,7 @@ def run_generic_fMRI_volume_processsing(**args):
       '--biascorrection={biascorrection} ' + \
       '--mctype="MCFLIRT"'
     cmd = cmd.format(**args)
+    print(cmd)
     run(cmd, cwd=args["path"], env={"OMP_NUM_THREADS": str(args["n_cpus"])})
 
     if isinstance(allechoes, list):
@@ -238,7 +260,7 @@ def run_generic_fMRI_volume_processsing(**args):
         # Apply OneStepResampling to later echoes
         for echo_idx, echo in enumerate(allechoes):
             args['fmritcs'] = echo
-            args['echonum'] = str(echo_idx + 1)
+            args['echonum'] = str(echo_idx + 2) #pop above
             run_onestep_resampling(**args)
 
         # run tedana
@@ -347,10 +369,10 @@ if args.analysis_level == "participant":
     for subject_label in subjects_to_analyze:
         t1ws = [f.path for f in layout.get(subject=subject_label,
                                                suffix='T1w',
-                                               extensions=["nii.gz", "nii"])]
+                                               extension=["nii.gz", "nii"])]
         t2ws = [f.path for f in layout.get(subject=subject_label,
                                                suffix='T2w',
-                                               extensions=["nii.gz", "nii"])]
+                                               extension=["nii.gz", "nii"])]
         assert (len(t1ws) > 0), "No T1w files found for subject %s!"%subject_label
         assert (len(t2ws) > 0), "No T2w files found for subject %s!"%subject_label
 
@@ -469,12 +491,12 @@ if args.analysis_level == "participant":
         bolds = [f.path for f in layout.get(subject=subject_label,
                                                 suffix='bold',
                                                 datatype='func',
-                                                extensions=["nii.gz", "nii"])]
+                                                extension=["nii.gz", "nii"])]
         
         # get multiple echoes as a list. Code from fmriprep
         if (args.multiecho != 'each') and (bolds is not []):
             try:
-                bolds = [list(bolds) for _, bold in groupby(bolds, key=_run_num)]
+                bolds = [list(bold) for _, bold in groupby(bolds, key=_run_num)]
                 bolds = list(map(lambda x: x[0] if len(x) == 1 else x, bolds))
             except AttributeError:
                 pass
@@ -555,7 +577,7 @@ if args.analysis_level == "participant":
                     stage_func()
 
         dwis = layout.get(subject=subject_label, suffix='dwi',
-                                                 extensions=["nii.gz", "nii"])
+                                                 extension=["nii.gz", "nii"])
 
         # print(dwis)
         # acqs = set(layout.get(target='acquisition', return_type='id',
